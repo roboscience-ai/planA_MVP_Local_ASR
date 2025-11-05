@@ -1,0 +1,12 @@
+# 语音处理核心库
+pyaudio>=0.2.11
+
+# 阿里云 DashScope SDK (ASR服务)
+dashscope>=1.14.0
+
+# WebSocket 客户端 (火山引擎 TTS 通信)
+websockets==10.4
+
+# 火山引擎协议库 (本地模块，位于 protocols/ 文件夹)
+# 注意：protocols 是本地模块，不需要通过 pip 安装
+
