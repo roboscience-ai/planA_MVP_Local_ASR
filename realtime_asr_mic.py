@@ -65,7 +65,7 @@ def build_full_client_request(seq: int):
     buf.extend(payload)
     return bytes(buf)
 
-def build_audio_packet(seq: int, audio_ bytes, is_last: bool = False):
+def build_audio_packet(seq: int, audio_data: bytes, is_last: bool = False):
     flags = 0b0011 if is_last else 0b0001  # NEG_WITH_SEQUENCE or POS_SEQUENCE
     header = build_header(MessageType.AUDIO_ONLY_REQ, flags=flags, serial=0b0000, comp=0b0001)
     compressed = gzip_compress(audio_data)
