@@ -16,11 +16,15 @@ import websockets
 from threading import Thread, Lock
 from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
 import dashscope
+from dashscope.common.error import InvalidParameter
 
 # 从火山引擎协议库导入
 from protocols import EventType, MsgType, full_client_request, receive_message
 
 # ==================== 配置 ====================
+# 阿里云 DashScope API Key
+DASHSCOPE_API_KEY = "sk-3bf1277c421648329ba41f0a4f7c9549"
+
 # 火山引擎TTS配置
 VOLC_APP_ID = "2634661217"
 VOLC_ACCESS_TOKEN = "0im2q3lyhxDTTt5GXNtzmNSj2-I_Lb3b"
@@ -175,12 +179,14 @@ def tts_worker():
 # ==================== 阿里云ASR ====================
 mic = None
 stream = None
+recognition_running = False
 
 class Callback(RecognitionCallback):
     def on_open(self) -> None:
-        global mic, stream
+        global mic, stream, recognition_running
         print("✅ 阿里云ASR已启动")
         print("🎙️ 请开始说话（识别到完整句子会自动播放）\n")
+        recognition_running = True
         
         mic = pyaudio.PyAudio()
         
@@ -201,12 +207,25 @@ class Callback(RecognitionCallback):
             raise
 
     def on_close(self) -> None:
-        global mic, stream, tts_running
+        global mic, stream, tts_running, recognition_running
         print("\n✅ ASR识别结束")
+        recognition_running = False
         tts_running = False  # 停止TTS线程
-        stream.stop_stream()
-        stream.close()
-        mic.terminate()
+        try:
+            if stream is not None:
+                stream.stop_stream()
+                stream.close()
+        except Exception:
+            pass
+        finally:
+            stream = None
+        try:
+            if mic is not None:
+                mic.terminate()
+        except Exception:
+            pass
+        finally:
+            mic = None
 
     def on_event(self, result: RecognitionResult) -> None:
         sentence = result.get_sentence()
@@ -230,6 +249,11 @@ class Callback(RecognitionCallback):
 
 # ==================== 主函数 ====================
 def main():
+    global tts_running, recognition_running
+    
+    # 设置阿里云API Key
+    dashscope.api_key = DASHSCOPE_API_KEY
+    
     print("=" * 60)
     print("🎙️  阿里云ASR → 火山引擎TTS 实时语音回声")
     print("=" * 60)
@@ -260,16 +284,41 @@ def main():
     
     recognition.start()
     
+    # 等待 stream 初始化
+    import time
+    timeout = 5  # 等待最多5秒
+    start_time = time.time()
+    while stream is None and (time.time() - start_time) < timeout:
+        time.sleep(0.1)
+    
+    if stream is None:
+        print("❌ 无法初始化音频流")
+        recognition.stop()
+        tts_running = False
+        return
+    
     try:
         # 持续发送音频
-        while stream:
-            data = stream.read(3200, exception_on_overflow=False)
-            recognition.send_audio_frame(data)
+        while recognition_running and stream and tts_running:
+            try:
+                data = stream.read(3200, exception_on_overflow=False)
+                recognition.send_audio_frame(data)
+            except InvalidParameter:
+                # 识别已停止，退出发送循环
+                break
+            except Exception as e:
+                if recognition_running:
+                    print(f"⚠️  发送音频帧错误: {e}")
+                break
     except KeyboardInterrupt:
         print("\n\n⏹️  用户中断")
     finally:
-        recognition.stop()
-        global tts_running
+        try:
+            if recognition_running:
+                recognition.stop()
+        except (InvalidParameter, Exception):
+            # 已停止或出错则忽略
+            pass
         tts_running = False
         # 等待TTS线程处理完
         print("\n⏳ 等待播放队列清空...")
@@ -278,8 +327,5 @@ def main():
 
 # ==================== 启动 ====================
 if __name__ == "__main__":
-    # 设置阿里云API Key（如果未设置环境变量）
-    # dashscope.api_key = "YOUR_DASHSCOPE_API_KEY" 
-    
     main()
 
