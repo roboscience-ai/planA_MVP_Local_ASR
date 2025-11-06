@@ -16,15 +16,23 @@ import websockets
 from threading import Thread, Lock
 from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
 import dashscope
+from dashscope.common.error import InvalidParameter
 
 # 从火山引擎协议库导入
 from protocols import EventType, MsgType, full_client_request, receive_message
 
 # ==================== 配置 ====================
+# 阿里云 DashScope API Key
+DASHSCOPE_API_KEY = "sk-3bf1277c421648329ba41f0a4f7c9549"
+
 # 火山引擎TTS配置
 VOLC_APP_ID = "2634661217"
 VOLC_ACCESS_TOKEN = "0im2q3lyhxDTTt5GXNtzmNSj2-I_Lb3b"
-VOLC_VOICE_TYPE = "zh_male_naiqimengwa_mars_bigtts"  # 可选其他音色
+VOLC_VOICE_TYPE = "zh_male_naiqimengwa_mars_bigtts"  # 主音色（男声）
+VOLC_FEMALE_VOICE = "ICL_zh_female_bingruoshaonv_tob"  # 女声音色（用于混合）
+USE_MIXED_VOICE = True  # 是否使用混合音色
+MALE_MIX_FACTOR = 0.45  # 男声混合比例（65%）
+FEMALE_MIX_FACTOR = 0.55  # 女声混合比例（35%）
 TTS_ENDPOINT = "wss://openspeech.bytedance.com/api/v3/tts/unidirectional/stream"
 
 # 音频参数
@@ -39,9 +47,13 @@ sentence_lock = Lock()
 tts_running = True
 # =================================================
 
-def get_resource_id(voice: str) -> str:
-    """根据音色选择Resource ID"""
-    if voice.startswith("S_"):
+def get_resource_id(use_mixed: bool = False) -> str:
+    """根据是否使用混合音色选择Resource ID"""
+    # 根据火山引擎文档，混合音色应使用 volc.service_type.10029
+    if use_mixed:
+        return "volc.service_type.10029"
+    # 单一音色时，根据音色类型判断
+    if VOLC_VOICE_TYPE.startswith("S_"):
         return "volc.megatts.default"
     return "volc.service_type.10029"
 
@@ -53,7 +65,7 @@ async def tts_synthesize(text: str) -> bytes:
     headers = {
         "X-Api-App-Key": VOLC_APP_ID,
         "X-Api-Access-Key": VOLC_ACCESS_TOKEN,
-        "X-Api-Resource-Id": get_resource_id(VOLC_VOICE_TYPE),
+        "X-Api-Resource-Id": get_resource_id(use_mixed=USE_MIXED_VOICE),
         "X-Api-Connect-Id": str(uuid.uuid4()),
     }
 
@@ -64,19 +76,40 @@ async def tts_synthesize(text: str) -> bytes:
             max_size=10 * 1024 * 1024
         )
         
-        # 准备请求
+        # 准备请求参数
+        req_params = {
+            "audio_params": {
+                "format": "pcm",
+                "sample_rate": RATE_TTS,
+                "enable_timestamp": False,
+            },
+            "text": text,
+            "additions": json.dumps({"disable_markdown_filter": False}),
+        }
+        
+        # 根据配置选择使用单一音色还是混合音色
+        if USE_MIXED_VOICE:
+            # 混合音色：speaker 设置为 custom_mix_bigtts，添加 mix_speaker 参数
+            req_params["speaker"] = "custom_mix_bigtts"
+            req_params["mix_speaker"] = {
+                "speakers": [
+                    {
+                        "source_speaker": VOLC_VOICE_TYPE,  # 男声
+                        "mix_factor": MALE_MIX_FACTOR
+                    },
+                    {
+                        "source_speaker": VOLC_FEMALE_VOICE,  # 女声
+                        "mix_factor": FEMALE_MIX_FACTOR
+                    }
+                ]
+            }
+        else:
+            # 单一音色：直接使用 speaker 字段
+            req_params["speaker"] = VOLC_VOICE_TYPE
+        
         request = {
             "user": {"uid": str(uuid.uuid4())},
-            "req_params": {
-                "speaker": VOLC_VOICE_TYPE,
-                "audio_params": {
-                    "format": "pcm",
-                    "sample_rate": RATE_TTS,
-                    "enable_timestamp": False,
-                },
-                "text": text,
-                "additions": json.dumps({"disable_markdown_filter": False}),
-            },
+            "req_params": req_params,
         }
         
         # 发送请求
@@ -175,12 +208,14 @@ def tts_worker():
 # ==================== 阿里云ASR ====================
 mic = None
 stream = None
+recognition_running = False
 
 class Callback(RecognitionCallback):
     def on_open(self) -> None:
-        global mic, stream
+        global mic, stream, recognition_running
         print("✅ 阿里云ASR已启动")
         print("🎙️ 请开始说话（识别到完整句子会自动播放）\n")
+        recognition_running = True
         
         mic = pyaudio.PyAudio()
         
@@ -201,12 +236,25 @@ class Callback(RecognitionCallback):
             raise
 
     def on_close(self) -> None:
-        global mic, stream, tts_running
+        global mic, stream, tts_running, recognition_running
         print("\n✅ ASR识别结束")
+        recognition_running = False
         tts_running = False  # 停止TTS线程
-        stream.stop_stream()
-        stream.close()
-        mic.terminate()
+        try:
+            if stream is not None:
+                stream.stop_stream()
+                stream.close()
+        except Exception:
+            pass
+        finally:
+            stream = None
+        try:
+            if mic is not None:
+                mic.terminate()
+        except Exception:
+            pass
+        finally:
+            mic = None
 
     def on_event(self, result: RecognitionResult) -> None:
         sentence = result.get_sentence()
@@ -230,11 +278,21 @@ class Callback(RecognitionCallback):
 
 # ==================== 主函数 ====================
 def main():
+    global tts_running, recognition_running
+    
+    # 设置阿里云API Key
+    dashscope.api_key = DASHSCOPE_API_KEY
+    
     print("=" * 60)
     print("🎙️  阿里云ASR → 火山引擎TTS 实时语音回声")
     print("=" * 60)
     print(f"ASR: 阿里云 Paraformer V2 (实时识别)")
-    print(f"TTS: 火山引擎 {VOLC_VOICE_TYPE}")
+    if USE_MIXED_VOICE:
+        print(f"TTS: 混合音色 (更女性化)")
+        print(f"  - 主音色: {VOLC_VOICE_TYPE} ({MALE_MIX_FACTOR*100:.0f}%)")
+        print(f"  - 女声音色: {VOLC_FEMALE_VOICE} ({FEMALE_MIX_FACTOR*100:.0f}%)")
+    else:
+        print(f"TTS: 火山引擎 {VOLC_VOICE_TYPE}")
     print(f"模式: 只播放完整句子 (sentence_end = True)")
     print("=" * 60)
     print()
@@ -260,16 +318,41 @@ def main():
     
     recognition.start()
     
+    # 等待 stream 初始化
+    import time
+    timeout = 5  # 等待最多5秒
+    start_time = time.time()
+    while stream is None and (time.time() - start_time) < timeout:
+        time.sleep(0.1)
+    
+    if stream is None:
+        print("❌ 无法初始化音频流")
+        recognition.stop()
+        tts_running = False
+        return
+    
     try:
         # 持续发送音频
-        while stream:
-            data = stream.read(3200, exception_on_overflow=False)
-            recognition.send_audio_frame(data)
+        while recognition_running and stream and tts_running:
+            try:
+                data = stream.read(3200, exception_on_overflow=False)
+                recognition.send_audio_frame(data)
+            except InvalidParameter:
+                # 识别已停止，退出发送循环
+                break
+            except Exception as e:
+                if recognition_running:
+                    print(f"⚠️  发送音频帧错误: {e}")
+                break
     except KeyboardInterrupt:
         print("\n\n⏹️  用户中断")
     finally:
-        recognition.stop()
-        global tts_running
+        try:
+            if recognition_running:
+                recognition.stop()
+        except (InvalidParameter, Exception):
+            # 已停止或出错则忽略
+            pass
         tts_running = False
         # 等待TTS线程处理完
         print("\n⏳ 等待播放队列清空...")
@@ -278,8 +361,5 @@ def main():
 
 # ==================== 启动 ====================
 if __name__ == "__main__":
-    # 设置阿里云API Key（如果未设置环境变量）
-    # dashscope.api_key = "YOUR_DASHSCOPE_API_KEY" 
-    
     main()
 
